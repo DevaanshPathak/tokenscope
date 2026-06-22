@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+tokenscope_export.json
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
