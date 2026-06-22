@@ -6,6 +6,7 @@ build/
 dist/
 *.spec
 tokenscope_export.json
+gpt2-local/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
