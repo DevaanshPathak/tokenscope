@@ -188,14 +188,17 @@ class AppSmokeTests(unittest.IsolatedAsyncioTestCase):
             root = make_tokenizer_dir(Path(tmp) / "primary", ["hello world"])
             app = TokenscopeApp(tokenizer_path=str(root))
             async with app.run_test(size=(150, 45)) as pilot:
-                await wait_for(lambda: app.primary_engine is not None, pilot)
+                await wait_for(
+                    lambda: app.primary_engine is not None
+                    and not app.query_one("#main-layout").has_class("hidden"),
+                    pilot,
+                )
                 text_input = app.query_one("#text-input", DebouncedTextInput)
                 text_input.value = "hello world"
                 text_input.emit_now()
                 await wait_for(lambda: app.primary_result is not None and len(app.primary_result.spans) >= 2, pilot)
                 app.action_select_next_token()
-                await pilot.pause(0.1)
-                self.assertEqual(app.selected_token_indices["primary"], 1)
+                await wait_for(lambda: app.selected_token_indices["primary"] == 1, pilot)
 
     async def test_special_token_toggle_reencodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
