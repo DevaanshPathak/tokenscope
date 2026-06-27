@@ -17,8 +17,9 @@ Initial public release of `tokenscope`, an offline terminal tokenizer explorer f
 
 - `tokenscope-linux-x86_64`
 - `tokenscope-windows-x86_64.exe`
+- `tokenscope-macos-*`
 
-macOS binaries are supported through the macOS build workflow or a macOS host build, but are not part of the manually attached v0.1.0 assets.
+The Linux and Windows binaries were attached manually first. The tag build workflow also builds and uploads the macOS binary when the macOS runner completes successfully.
 
 ## Validation
 
