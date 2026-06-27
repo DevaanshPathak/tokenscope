@@ -17,11 +17,18 @@ class TokenView(Static):
         message = Text("Type text to see colored token spans.", style="dim")
         self.update(message)
 
-    def update_tokens(self, result: TokenizationResult | None) -> None:
+    def update_tokens(
+        self,
+        result: TokenizationResult | None,
+        *,
+        selected_index: int | None = None,
+        match_indices: set[int] | None = None,
+    ) -> None:
         if result is None or not result.spans:
             self.show_empty()
             return
 
+        match_indices = match_indices or set()
         colored = Text()
         boundary = Text("boundaries ", style="dim")
         ids = Text("token ids  ", style="dim")
@@ -29,6 +36,10 @@ class TokenView(Static):
         cursor = 0
         for index, span in enumerate(result.spans):
             style = f"bold {TOKEN_COLORS[index % len(TOKEN_COLORS)]}"
+            if index == selected_index:
+                style += " reverse"
+            elif index in match_indices:
+                style += " underline"
             if span.offset_start > cursor:
                 colored.append(self._visible(result.input_text[cursor : span.offset_start]), style="dim")
 
@@ -38,8 +49,8 @@ class TokenView(Static):
 
             width = max(cell_len(self._visible(display_text)), cell_len(str(span.token_id)), 1)
             if index:
-                boundary.append("·", style="dim")
-                ids.append("·", style="dim")
+                boundary.append(".", style="dim")
+                ids.append(".", style="dim")
             boundary.append(set_cell_size(self._visible(display_text), width), style=style)
             ids.append(set_cell_size(str(span.token_id), width), style=style)
 

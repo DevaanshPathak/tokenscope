@@ -7,12 +7,18 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
 from tokenizers import Tokenizer
 from tokenizers.implementations import BertWordPieceTokenizer, ByteLevelBPETokenizer
 
 
 class TokenizerLoadError(ValueError):
     """Raised when a local tokenizer path cannot be loaded."""
+
+
+class ChatTemplateError(ValueError):
+    """Raised when a tokenizer chat template cannot be rendered."""
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,17 @@ class MergeNode:
 
 
 class TokenizerEngine:
+    CONFIG_FILE_NAMES = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "config.json",
+        "vocab.txt",
+        "vocab.json",
+        "merges.txt",
+    )
+
     def __init__(
         self,
         tokenizer: Tokenizer,
@@ -72,16 +89,22 @@ class TokenizerEngine:
         name: str,
         tokenizer_type: str,
         raw_config: dict[str, Any] | None = None,
+        tokenizer_config: dict[str, Any] | None = None,
         merge_ranks: dict[tuple[str, str], int] | None = None,
+        loaded_tokenizer_file: Path | None = None,
+        config_files_found: Sequence[Path] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.source_path = source_path
         self.name = name
         self.tokenizer_type = tokenizer_type
         self.raw_config = raw_config or {}
+        self.tokenizer_config = tokenizer_config or {}
         self.vocab = tokenizer.get_vocab()
         self.vocab_size = tokenizer.get_vocab_size()
         self.merge_ranks = merge_ranks or {}
+        self.loaded_tokenizer_file = loaded_tokenizer_file.resolve() if loaded_tokenizer_file else None
+        self.config_files_found = tuple(path.resolve() for path in (config_files_found or ()))
         self._vocab_by_id = sorted(self.vocab.items(), key=lambda item: item[1])
 
     @classmethod
@@ -111,6 +134,8 @@ class TokenizerEngine:
         tokenizer_type = cls._detect_type(tokenizer, raw_tokenizer)
         name = cls._detect_name(root, config, raw_tokenizer)
         merge_ranks = cls._extract_merge_ranks(raw_tokenizer, root)
+        loaded_tokenizer_file = cls._detect_loaded_tokenizer_file(root, tokenizer_file)
+        config_files_found = cls._discover_config_files(root, tokenizer_file)
 
         return cls(
             tokenizer=tokenizer,
@@ -118,7 +143,10 @@ class TokenizerEngine:
             name=name,
             tokenizer_type=tokenizer_type,
             raw_config=raw_tokenizer,
+            tokenizer_config=config,
             merge_ranks=merge_ranks,
+            loaded_tokenizer_file=loaded_tokenizer_file,
+            config_files_found=config_files_found,
         )
 
     @staticmethod
@@ -166,6 +194,27 @@ class TokenizerEngine:
             "Missing tokenizer files. Expected tokenizer.json, tokenizer_config.json, "
             "vocab.txt, or vocab.json plus merges.txt."
         )
+
+    @classmethod
+    def _detect_loaded_tokenizer_file(cls, root: Path, tokenizer_file: Path | None) -> Path | None:
+        if tokenizer_file is not None:
+            return tokenizer_file
+        if (root / "vocab.txt").exists():
+            return root / "vocab.txt"
+        if (root / "vocab.json").exists():
+            return root / "vocab.json"
+        return None
+
+    @classmethod
+    def _discover_config_files(cls, root: Path, tokenizer_file: Path | None) -> tuple[Path, ...]:
+        found: list[Path] = []
+        if tokenizer_file is not None and tokenizer_file.exists():
+            found.append(tokenizer_file)
+        for name in cls.CONFIG_FILE_NAMES:
+            path = root / name
+            if path.exists() and path not in found:
+                found.append(path)
+        return tuple(found)
 
     @staticmethod
     def _detect_type(tokenizer: Tokenizer, raw_tokenizer: dict[str, Any] | None) -> str:
@@ -226,17 +275,120 @@ class TokenizerEngine:
         return self.tokenizer_type.lower() == "bpe" or bool(self.merge_ranks)
 
     @property
+    def is_byte_level(self) -> bool:
+        raw_pre_tokenizer = (self.raw_config or {}).get("pre_tokenizer")
+        if self._raw_component_has_type(raw_pre_tokenizer, "ByteLevel"):
+            return True
+        raw_decoder = (self.raw_config or {}).get("decoder")
+        if self._raw_component_has_type(raw_decoder, "ByteLevel"):
+            return True
+        pre_tokenizer = self.tokenizer.pre_tokenizer
+        decoder = self.tokenizer.decoder
+        return (
+            type(pre_tokenizer).__name__ == "ByteLevel"
+            or type(decoder).__name__ == "ByteLevel"
+        )
+
+    @property
     def header_label(self) -> str:
         return (
             f"tokenscope v0.1 | {self.name} | "
             f"{self.tokenizer_type} | vocab: {self.vocab_size}"
         )
 
-    def encode(self, text: str) -> TokenizationResult:
+    @property
+    def chat_template(self) -> str | None:
+        return self._normalize_chat_template(
+            self.tokenizer_config.get("chat_template")
+            or self.raw_config.get("chat_template")
+        )
+
+    @staticmethod
+    def _normalize_chat_template(value: Any) -> str | None:
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            template = value.get("template")
+            return template if isinstance(template, str) and template else None
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and item.get("name") == "default":
+                    template = item.get("template")
+                    if isinstance(template, str) and template:
+                        return template
+            for item in value:
+                if isinstance(item, dict):
+                    template = item.get("template")
+                    if isinstance(template, str) and template:
+                        return template
+                elif isinstance(item, str) and item:
+                    return item
+        return None
+
+    def render_chat_template(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        add_generation_prompt: bool = False,
+    ) -> str:
+        template = self.chat_template
+        if not template:
+            raise ChatTemplateError("Tokenizer does not define a chat_template.")
+
+        environment = SandboxedEnvironment(
+            autoescape=False,
+            trim_blocks=True,
+            lstrip_blocks=True,
+            undefined=StrictUndefined,
+        )
+        environment.globals["raise_exception"] = self._raise_chat_template_exception
+        environment.globals["strftime_now"] = lambda _format: ""
+
+        context: dict[str, Any] = {
+            "messages": list(messages),
+            "add_generation_prompt": add_generation_prompt,
+            **self.special_token_variables(),
+        }
+        try:
+            return environment.from_string(template).render(**context)
+        except ChatTemplateError:
+            raise
+        except Exception as exc:
+            raise ChatTemplateError(f"Chat template render failed: {exc}") from exc
+
+    def special_token_variables(self) -> dict[str, str | None]:
+        values: dict[str, str | None] = {}
+        for source in (self.tokenizer_config, self.raw_config):
+            for key, value in source.items():
+                if key.endswith("_token") and isinstance(value, str):
+                    values[key] = value
+                elif key.endswith("_token") and isinstance(value, dict):
+                    content = value.get("content")
+                    if isinstance(content, str):
+                        values[key] = content
+        for token_id, token in self.tokenizer.get_added_tokens_decoder().items():
+            content = str(getattr(token, "content", str(token)))
+            key = content.strip("[]<>").lower().replace("-", "_")
+            if key:
+                values.setdefault(f"{key}_token", content)
+        return values
+
+    @staticmethod
+    def _raise_chat_template_exception(message: str) -> None:
+        raise ChatTemplateError(message)
+
+    def encode(self, text: str, *, encode_special_tokens: bool = False) -> TokenizationResult:
         if not text:
             return self._empty_result()
 
-        encoding = self.tokenizer.encode(text)
+        previous_encode_special = getattr(self.tokenizer, "encode_special_tokens", None)
+        if previous_encode_special is not None:
+            self.tokenizer.encode_special_tokens = encode_special_tokens
+        try:
+            encoding = self.tokenizer.encode(text)
+        finally:
+            if previous_encode_special is not None:
+                self.tokenizer.encode_special_tokens = previous_encode_special
         tokens = tuple(encoding.tokens)
         ids = tuple(int(token_id) for token_id in encoding.ids)
         offsets = tuple(encoding.offsets)
@@ -325,6 +477,18 @@ class TokenizerEngine:
                     break
         return matches
 
+    def token_to_id(self, token: str) -> int | None:
+        token_id = self.tokenizer.token_to_id(token)
+        return int(token_id) if token_id is not None else None
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool = False,
+    ) -> str:
+        return self.tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
+
     def render_bpe_merge_tree(self, result: TokenizationResult | None, max_tokens: int = 24) -> str:
         if not self.is_bpe:
             return "Merge tree only available for BPE tokenizers."
@@ -333,24 +497,39 @@ class TokenizerEngine:
 
         lines: list[str] = []
         for span in result.spans[:max_tokens]:
-            lines.append(f"[{span.index}] {span.token!r} id={span.token_id}")
-            node, exact = self._build_bpe_tree(span.token)
-            if node is None:
-                lines.append("  no merge history found")
-                continue
-            self._render_node(node, lines, prefix="  ")
-            if not exact:
-                lines.append("  note: token contains segments not present in merge ranks")
+            lines.extend(self._render_single_span_lines(span))
+            lines.append("")
+
+        if lines and lines[-1] == "":
+            lines.pop()
 
         if len(result.spans) > max_tokens:
             lines.append(f"... {len(result.spans) - max_tokens} more tokens omitted")
         return "\n".join(lines)
 
-    def _build_bpe_tree(self, token: str) -> tuple[MergeNode | None, bool]:
+    def render_single_token_merge_tree(self, span: TokenSpan | None) -> str:
+        if not self.is_bpe:
+            return "Merge tree only available for BPE tokenizers."
+        if span is None:
+            return "No token selected."
+        return "\n".join(self._render_single_span_lines(span))
+
+    def _render_single_span_lines(self, span: TokenSpan) -> list[str]:
+        lines = [f"[{span.index}] {span.token!r} id={span.token_id}"]
+        node, exact = self._build_bpe_tree(span.token, span.text)
+        if node is None:
+            lines.append("  no merge history found")
+            return lines
+        self._render_node(node, lines, prefix="  ")
+        if not exact:
+            lines.append("  note: token contains segments not present in merge ranks")
+        return lines
+
+    def _build_bpe_tree(self, token: str, span_text: str | None = None) -> tuple[MergeNode | None, bool]:
         if not token:
             return None, False
 
-        nodes = [MergeNode(symbol) for symbol in self._initial_symbols(token)]
+        nodes = [MergeNode(symbol) for symbol in self._initial_symbols(token, span_text)]
         if len(nodes) == 1:
             return nodes[0], True
 
@@ -379,11 +558,51 @@ class TokenizerEngine:
 
         return nodes[0], exact
 
-    @staticmethod
-    def _initial_symbols(token: str) -> list[str]:
+    def _initial_symbols(self, token: str, span_text: str | None = None) -> list[str]:
         if token.startswith("<") and token.endswith(">"):
             return [token]
+        if self.is_byte_level:
+            token_symbols = list(token)
+            if self._can_reconstruct_token_from_symbols(token_symbols, token):
+                return token_symbols
+            if span_text:
+                return self.byte_level_symbols(span_text)
         return list(token)
+
+    @classmethod
+    def byte_level_symbols(cls, text: str) -> list[str]:
+        byte_encoder = cls._byte_encoder()
+        return [byte_encoder[byte] for byte in text.encode("utf-8", errors="replace")]
+
+    @staticmethod
+    def _can_reconstruct_token_from_symbols(symbols: Sequence[str], token: str) -> bool:
+        return "".join(symbols) == token
+
+    @staticmethod
+    def _raw_component_has_type(component: Any, type_name: str) -> bool:
+        if isinstance(component, dict):
+            if component.get("type") == type_name:
+                return True
+            return any(TokenizerEngine._raw_component_has_type(value, type_name) for value in component.values())
+        if isinstance(component, list):
+            return any(TokenizerEngine._raw_component_has_type(value, type_name) for value in component)
+        return False
+
+    @staticmethod
+    def _byte_encoder() -> dict[int, str]:
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(161, 173))
+            + list(range(174, 256))
+        )
+        cs = bs[:]
+        n = 0
+        for byte in range(256):
+            if byte not in bs:
+                bs.append(byte)
+                cs.append(256 + n)
+                n += 1
+        return dict(zip(bs, (chr(value) for value in cs), strict=True))
 
     @classmethod
     def _render_node(cls, node: MergeNode, lines: list[str], prefix: str) -> None:

@@ -1,0 +1,111 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Linux binary
+        run: bash scripts/build-linux-docker.sh
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenscope-linux-x86_64
+          path: dist/tokenscope-linux-x86_64
+
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Build Windows binary
+        shell: pwsh
+        run: .\scripts\build-windows.ps1
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenscope-windows-x86_64
+          path: dist/tokenscope-windows-x86_64.exe
+
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Build macOS binary
+        run: bash scripts/build-macos.sh
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenscope-macos
+          path: dist/tokenscope-macos-*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes_file="changelog_${TAG_NAME}.md"
+          if [ ! -f "$notes_file" ]; then
+            notes_file="README.md"
+          fi
+          release_title="tokenscope ${TAG_NAME}"
+          if [ "$TAG_NAME" = "v0.1.0" ]; then
+            release_title="tokenscope v0.1"
+          fi
+          mapfile -t assets < <(find artifacts -type f -name "tokenscope-*" | sort)
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" --title "$release_title" --notes-file "$notes_file"
+            gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" --title "$release_title" --notes-file "$notes_file"
+          fi

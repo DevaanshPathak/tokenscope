@@ -1,0 +1,17 @@
+FROM python:3.14-slim
+
+WORKDIR /src
+
+ENV PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends binutils && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+COPY . .
+RUN pyinstaller --clean --noconfirm tokenscope.spec && \
+    mkdir -p /out && \
+    cp dist/tokenscope /out/tokenscope-linux-x86_64
